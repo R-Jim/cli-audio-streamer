@@ -16,14 +16,14 @@ import (
 
 // Audio parameters
 const (
-	SampleRate = 48000 // Hz
-	Channels   = 2     // Stereo
-
-	FramesPerBuffer = 512 // Number of audio frames per buffer
+	SampleRate      = 48000 // Hz
+	Channels        = 2     // Stereo
+	FramesPerBuffer = 512   // Number of audio frames per buffer
+	ServerAudioPort = 8080  // Default server port for audio
 )
 
 func main() {
-	serverAddrStr := flag.String("server", "127.0.0.1:8080", "Server address (IP:Port) for audio stream")
+	serverIP := flag.String("server", "127.0.0.1", "Server IP address for audio stream")
 	initialVolume := flag.Float64("volume", 1.0, "Initial client-side volume adjustment (0.0 to 1.0)")
 	controlPort := flag.Int("control-port", 8081, "Port to listen for server control messages")
 	listDevices := flag.Bool("list-devices", false, "List available audio input devices and exit.")
@@ -58,8 +58,11 @@ func main() {
 	var currentClientVolume atomic.Value
 	currentClientVolume.Store(*initialVolume)
 
+	// Construct server address string
+	serverAddrStr := fmt.Sprintf("%s:%d", *serverIP, ServerAudioPort)
+
 	// Resolve server address for audio stream
-	serverAddr, err := net.ResolveUDPAddr("udp", *serverAddrStr)
+	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
 	if err != nil {
 		log.Fatalf("Error resolving server address: %v", err)
 	}
@@ -171,7 +174,7 @@ func main() {
 	}
 	defer stream.Stop()
 
-	fmt.Printf("Client started. Streaming audio to %s\\n", *serverAddrStr)
+	fmt.Printf("Client started. Streaming audio to %s\\n", serverAddrStr)
 	fmt.Printf("Initial client-side volume: %.2f. Listening for server volume control on port %d\\n", currentClientVolume.Load().(float64), *controlPort)
 	if stereoMixFound {
 		fmt.Println("Attempting to use 'Stereo Mix' for audio input.")
