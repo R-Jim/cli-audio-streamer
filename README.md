@@ -4,10 +4,11 @@ A simple command-line tool for streaming audio from a client to a server over UD
 
 ## About
 
-This project consists of two main components:
+This project consists of three main components:
 
 - **Client**: Captures audio from the default input device (or "Stereo Mix" if available) and streams it to a server.
 - **Server**: Receives the audio stream and plays it on the default output device.
+- **Mock Client**: A simple client that sends a simulated audio stream, useful for testing the server.
 
 ## Getting Started
 
@@ -24,11 +25,12 @@ brew install portaudio
 
 ### Building
 
-To build the client and server, run the following commands:
+To build the client, server, and mock client, run the following commands:
 
 ```sh
 cd client && go build
 cd ../server && go build
+cd ../mock-client && go build
 ```
 
 ## Usage
@@ -53,6 +55,22 @@ For example:
 
 ```sh
 ./client/audio-client --server 127.0.0.1:8080
+```
+
+### Mock Client (for testing)
+
+The mock client sends a simulated audio stream to the server. This is useful for testing the server without a real audio source.
+
+To start the mock client, run the following command:
+
+```sh
+./mock-client/mock-client <server-ip>:<server-port>
+```
+
+For example:
+
+```sh
+./mock-client/mock-client 127.0.0.1:8080
 ```
 
 ## License

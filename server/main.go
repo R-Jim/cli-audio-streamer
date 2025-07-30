@@ -118,6 +118,33 @@ func main() {
 	}
 	defer stream.Close()
 
+	// Create a buffered channel to hold incoming audio packets
+	packetChannel := make(chan []byte, 100) // Buffer up to 100 packets
+
+	// Goroutine to read from network and send to channel
+	go func() {
+		for {
+			buffer := make([]byte, PacketSize)
+			n, _, err := audioConn.ReadFromUDP(buffer)
+			if err != nil {
+				log.Printf("Error reading UDP packet: %v", err)
+				continue
+			}
+			if n == PacketSize {
+				packetChannel <- buffer[:n]
+			} else {
+				log.Printf("Received packet of unexpected size: %d bytes (expected %d)", n, PacketSize)
+			}
+		}
+	}()
+
+	// Pre-buffering: wait until we have a few packets
+	fmt.Println("Pre-buffering audio...")
+	for len(packetChannel) < 4 { // Start when we have 4 packets
+		time.Sleep(10 * time.Millisecond)
+	}
+	fmt.Println("Pre-buffering complete. Starting playback.")
+
 	// Start the stream
 	err = stream.Start()
 	if err != nil {
@@ -125,26 +152,12 @@ func main() {
 	}
 	defer stream.Stop()
 
-	// Buffer for receiving data
-	receiveBuffer := make([]byte, PacketSize)
-
 	for {
-		// Read UDP packet
-		n, _, err := audioConn.ReadFromUDP(receiveBuffer)
-		if err != nil {
-			log.Printf("Error reading UDP packet: %v", err)
-			// Small delay to prevent busy-looping on network errors
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
-		if n != PacketSize {
-			log.Printf("Received packet of unexpected size: %d bytes (expected %d)", n, PacketSize)
-			continue
-		}
+		// Get the next packet from the channel
+		receiveBuffer := <-packetChannel
 
 		// Read int16 samples from byte buffer
-		reader := bytes.NewReader(receiveBuffer[:n])
+		reader := bytes.NewReader(receiveBuffer)
 		for i := 0; i < len(outputBuffer); i++ {
 			var sample int16
 			err = binary.Read(reader, binary.LittleEndian, &sample)
