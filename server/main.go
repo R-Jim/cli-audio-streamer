@@ -119,7 +119,7 @@ func main() {
 	defer stream.Close()
 
 	// Create a buffered channel to hold incoming audio packets
-	packetChannel := make(chan []byte, 200) // Buffer up to 200 packets
+	packetChannel := make(chan []byte, 100) // Buffer up to 100 packets
 
 	// Goroutine to read from network and send to channel
 	go func() {
@@ -145,11 +145,11 @@ func main() {
 
 	// Dynamic Jitter Buffer Management
 	const (
-		MinPrebufferSize = 10  // Minimum packets to start playback
-		MaxBufferSize    = 200 // Corresponds to channel capacity
-		TargetBufferSize = 25  // Ideal number of packets in buffer
-		HighWaterMark    = 40  // Speed up playback if buffer exceeds this
-		LowWaterMark     = 15  // Slow down playback if buffer falls below this
+		MinPrebufferSize = 5   // Minimum packets to start playback
+		MaxBufferSize    = 100 // Corresponds to channel capacity
+		TargetBufferSize = 15  // Ideal number of packets in buffer
+		HighWaterMark    = 20  // Speed up playback if buffer exceeds this
+		LowWaterMark     = 10  // Slow down playback if buffer falls below this
 	)
 
 	// Pre-buffering: wait until we have a minimum number of packets
