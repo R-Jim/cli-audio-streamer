@@ -9,7 +9,6 @@ import (
 	"net"
 	"strings"
 	"sync/atomic" // For atomic.Value
-	"time"
 
 	"github.com/gordonklaus/portaudio"
 )
@@ -128,9 +127,37 @@ func main() {
 		}
 	}()
 
+	// Buffer for sending data over UDP.
+	sendBuffer := new(bytes.Buffer)
+
+	// audioCallback is the function called by PortAudio when new audio data is available.
+	audioCallback := func(in []int16) {
+		sendBuffer.Reset() // Clear buffer for new data
+
+		// Get current volume.
+		vol := currentClientVolume.Load().(float64)
+
+		// Apply volume adjustment and write to buffer.
+		for _, sample := range in {
+			adjustedSample := int16(float64(sample) * vol)
+			err := binary.Write(sendBuffer, binary.LittleEndian, adjustedSample)
+			if err != nil {
+				log.Printf("Error writing sample to buffer: %v", err)
+				// Continue processing the rest of the buffer.
+			}
+		}
+
+		// Send the audio buffer over UDP if it has data.
+		if sendBuffer.Len() > 0 {
+			_, err := audioConn.Write(sendBuffer.Bytes())
+			if err != nil {
+				log.Printf("Error sending UDP packet: %v", err)
+			}
+		}
+	}
+
 	// Open audio input stream
 	var stream *portaudio.Stream
-	inputBuffer := make([]int16, FramesPerBuffer*Channels) // 16-bit stereo samples
 
 	// Attempt to find and use "Stereo Mix" on the WASAPI Host API
 	var stereoMixDevice *portaudio.DeviceInfo
@@ -151,7 +178,7 @@ func main() {
 				SampleRate:      SampleRate,
 				FramesPerBuffer: FramesPerBuffer,
 			}
-			stream, err = portaudio.OpenStream(param, inputBuffer)
+			stream, err = portaudio.OpenStream(param, audioCallback)
 		}
 	}
 
@@ -166,52 +193,29 @@ func main() {
 		}
 
 		// Open the default stream as a fallback.
-		stream, err = portaudio.OpenDefaultStream(Channels, 0, SampleRate, FramesPerBuffer, inputBuffer)
+		stream, err = portaudio.OpenDefaultStream(Channels, 0, SampleRate, FramesPerBuffer, audioCallback)
 		if err != nil {
 			// If even the default stream fails, we have to exit.
 			log.Fatalf("Error opening default input stream after fallback: %v", err)
 		}
 	}
+	defer stream.Close()
+
 	if stereoMixFound {
 		fmt.Println("Using 'Stereo Mix' on WASAPI for audio input.")
 	} else {
 		fmt.Println("Using default input device.")
 	}
-	fmt.Println("Press Ctrl+C to stop.")
 
-	// Buffer for sending data
-	sendBuffer := new(bytes.Buffer)
-
-	for {
-		// Read audio frames from input device
-		err = stream.Read()
-		if err != nil {
-			log.Printf("Error reading from stream: %v", err)
-			continue
-		}
-
-		sendBuffer.Reset() // Clear buffer for new data
-
-		// Get current volume
-		vol := currentClientVolume.Load().(float64)
-
-		// Apply volume adjustment and write to buffer
-		for i := range inputBuffer {
-			// Apply volume: float64(sample) * volume
-			adjustedSample := int16(float64(inputBuffer[i]) * vol)
-			err = binary.Write(sendBuffer, binary.LittleEndian, adjustedSample)
-			if err != nil {
-				log.Printf("Error writing sample to buffer: %v", err)
-				continue
-			}
-		}
-
-		// Send the audio buffer over UDP
-		_, err = audioConn.Write(sendBuffer.Bytes())
-		if err != nil {
-			log.Printf("Error sending UDP packet: %v", err)
-			// Small delay to prevent busy-looping on network errors
-			time.Sleep(10 * time.Millisecond)
-		}
+	// Start the stream
+	err = stream.Start()
+	if err != nil {
+		log.Fatalf("Error starting stream: %v", err)
 	}
+	defer stream.Stop()
+
+	fmt.Println("Streaming... Press Ctrl+C to stop.")
+
+	// Block the main goroutine indefinitely
+	select {}
 }
