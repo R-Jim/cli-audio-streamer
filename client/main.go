@@ -22,6 +22,17 @@ const (
 	ServerAudioPort = 8080  // Default server port for audio
 )
 
+// findWasapiStereoMixDevice searches for a "Stereo Mix" device on the "Windows WASAPI" host API.
+func findWasapiStereoMixDevice(devices []*portaudio.DeviceInfo) (device *portaudio.DeviceInfo, found bool) {
+	for _, info := range devices {
+		// Case-insensitive search for "Stereo Mix" on the WASAPI host API
+		if info.HostApi != nil && info.HostApi.Name == "Windows WASAPI" && info.MaxInputChannels > 0 && strings.Contains(strings.ToLower(info.Name), "stereo mix") {
+			return info, true
+		}
+	}
+	return nil, false
+}
+
 func main() {
 	serverIP := flag.String("server", "127.0.0.1", "Server IP address for audio stream")
 	initialVolume := flag.Float64("volume", 1.0, "Initial client-side volume adjustment (0.0 to 1.0)")
@@ -121,24 +132,16 @@ func main() {
 	var stream *portaudio.Stream
 	inputBuffer := make([]int16, FramesPerBuffer*Channels) // 16-bit stereo samples
 
-	// Attempt to find and use "Stereo Mix"
-	stereoMixFound := false
+	// Attempt to find and use "Stereo Mix" on the WASAPI Host API
+	var stereoMixDevice *portaudio.DeviceInfo
+	var stereoMixFound bool
 	devices, err := portaudio.Devices()
 	if err != nil {
 		log.Printf("Warning: Error listing devices: %v. Will try default input.", err)
 	} else {
-		var stereoMixDevice *portaudio.DeviceInfo
-		for _, info := range devices {
-			// Case-insensitive search for "Stereo Mix" or similar
-			if info.MaxInputChannels > 0 && strings.Contains(strings.ToLower(info.Name), "stereo mix") {
-				stereoMixDevice = info
-				stereoMixFound = true
-				break
-			}
-		}
-
+		stereoMixDevice, stereoMixFound = findWasapiStereoMixDevice(devices)
 		if stereoMixFound {
-			log.Printf("Found 'Stereo Mix' device: %s. Attempting to use it.", stereoMixDevice.Name)
+			log.Printf("Found 'Stereo Mix' device on %s: %s. Attempting to use it.", stereoMixDevice.HostApi.Name, stereoMixDevice.Name)
 			param := portaudio.StreamParameters{
 				Input: portaudio.StreamDeviceParameters{
 					Device:   stereoMixDevice,
@@ -152,34 +155,27 @@ func main() {
 		}
 	}
 
-	// If Stereo Mix not found or failed to open, fall back to default
+	// If Stereo Mix on WASAPI is not found, or if opening it fails, fall back to the default device.
 	if !stereoMixFound || err != nil {
-		if !stereoMixFound {
-			log.Println("Warning: 'Stereo Mix' device not found. Falling back to default input device.")
+		if stereoMixFound {
+			// This executes if we found the device but failed to open it.
+			log.Printf("Warning: Failed to open 'Stereo Mix' stream on WASAPI: %v. Falling back to default input device.", err)
 		} else {
-			log.Printf("Warning: Failed to open 'Stereo Mix' stream: %v. Falling back to default input device.", err)
+			// This executes if we never found the device.
+			log.Println("Warning: 'Stereo Mix' on WASAPI not found. Falling back to default input device.")
 		}
+
+		// Open the default stream as a fallback.
 		stream, err = portaudio.OpenDefaultStream(Channels, 0, SampleRate, FramesPerBuffer, inputBuffer)
+		if err != nil {
+			// If even the default stream fails, we have to exit.
+			log.Fatalf("Error opening default input stream after fallback: %v", err)
+		}
 	}
-
-	if err != nil {
-		log.Fatalf("Error opening input stream (after trying Stereo Mix and default): %v", err)
-	}
-	defer stream.Close()
-
-	// Start the stream
-	err = stream.Start()
-	if err != nil {
-		log.Fatalf("Error starting input stream: %v", err)
-	}
-	defer stream.Stop()
-
-	fmt.Printf("Client started. Streaming audio to %s\\n", serverAddrStr)
-	fmt.Printf("Initial client-side volume: %.2f. Listening for server volume control on port %d\\n", currentClientVolume.Load().(float64), *controlPort)
 	if stereoMixFound {
-		fmt.Println("Attempting to use 'Stereo Mix' for audio input.")
+		fmt.Println("Using 'Stereo Mix' on WASAPI for audio input.")
 	} else {
-		fmt.Println("Using default input device (could not find 'Stereo Mix').")
+		fmt.Println("Using default input device.")
 	}
 	fmt.Println("Press Ctrl+C to stop.")
 
@@ -200,7 +196,7 @@ func main() {
 		vol := currentClientVolume.Load().(float64)
 
 		// Apply volume adjustment and write to buffer
-		for i := 0; i < len(inputBuffer); i++ {
+		for i := range inputBuffer {
 			// Apply volume: float64(sample) * volume
 			adjustedSample := int16(float64(inputBuffer[i]) * vol)
 			err = binary.Write(sendBuffer, binary.LittleEndian, adjustedSample)
