@@ -37,6 +37,8 @@ func main() {
 	initialVolume := flag.Float64("volume", 1.0, "Initial client-side volume adjustment (0.0 to 1.0)")
 	controlPort := flag.Int("control-port", 8081, "Port to listen for server control messages")
 	listDevices := flag.Bool("list-devices", false, "List available audio input devices and exit.")
+	deviceName := flag.String("device-name", "", "Name of the audio input device to use.")
+	deviceIndex := flag.Int("device-index", -1, "Index of the audio input device to use.")
 	flag.Parse()
 
 	if *initialVolume < 0.0 || *initialVolume > 1.0 {
@@ -156,56 +158,87 @@ func main() {
 		}
 	}
 
-	// Open audio input stream
-	var stream *portaudio.Stream
-
-	// Attempt to find and use "Stereo Mix" on the WASAPI Host API
-	var stereoMixDevice *portaudio.DeviceInfo
-	var stereoMixFound bool
+	// --- Device Selection Logic ---
+	var chosenDevice *portaudio.DeviceInfo
 	devices, err := portaudio.Devices()
 	if err != nil {
-		log.Printf("Warning: Error listing devices: %v. Will try default input.", err)
-	} else {
-		stereoMixDevice, stereoMixFound = findWasapiStereoMixDevice(devices)
-		if stereoMixFound {
-			log.Printf("Found 'Stereo Mix' device on %s: %s. Attempting to use it.", stereoMixDevice.HostApi.Name, stereoMixDevice.Name)
-			param := portaudio.StreamParameters{
-				Input: portaudio.StreamDeviceParameters{
-					Device:   stereoMixDevice,
-					Channels: Channels,
-					Latency:  stereoMixDevice.DefaultLowInputLatency,
-				},
-				SampleRate:      SampleRate,
-				FramesPerBuffer: FramesPerBuffer,
-			}
-			stream, err = portaudio.OpenStream(param, audioCallback)
-		}
+		log.Fatalf("Error listing devices for stream setup: %v", err)
 	}
 
-	// If Stereo Mix on WASAPI is not found, or if opening it fails, fall back to the default device.
-	if !stereoMixFound || err != nil {
-		if stereoMixFound {
-			// This executes if we found the device but failed to open it.
-			log.Printf("Warning: Failed to open 'Stereo Mix' stream on WASAPI: %v. Falling back to default input device.", err)
+	if *deviceIndex >= 0 {
+		// User specified a device index
+		if *deviceIndex < len(devices) {
+			if devices[*deviceIndex].MaxInputChannels > 0 {
+				chosenDevice = devices[*deviceIndex]
+				log.Printf("Using specified device by index: [%d] %s", *deviceIndex, chosenDevice.Name)
+			} else {
+				log.Fatalf("Device at index %d is not an input device.", *deviceIndex)
+			}
 		} else {
-			// This executes if we never found the device.
-			log.Println("Warning: 'Stereo Mix' on WASAPI not found. Falling back to default input device.")
+			log.Fatalf("Invalid device index: %d. Max index is %d.", *deviceIndex, len(devices)-1)
 		}
+	} else if *deviceName != "" {
+		// User specified a device name
+		var found bool
+		for _, device := range devices {
+			if strings.EqualFold(device.Name, *deviceName) && device.MaxInputChannels > 0 {
+				chosenDevice = device
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Fatalf("Specified device '%s' not found or is not an input device.", *deviceName)
+		}
+		log.Printf("Using specified device by name: %s", chosenDevice.Name)
+	} else {
+		// Default behavior: search for "Stereo Mix"
+		var found bool
+		chosenDevice, found = findWasapiStereoMixDevice(devices)
+		if !found {
+			log.Println("Warning: 'Stereo Mix' on WASAPI not found. Will fall back to default device.")
+		}
+	}
+	// --- End of Device Selection ---
 
-		// Open the default stream as a fallback.
+	var stream *portaudio.Stream
+	var useDefault bool
+
+	if chosenDevice != nil {
+		// A specific device was chosen (by index, name, or 'Stereo Mix' search)
+		log.Printf("Attempting to open stream with: %s", chosenDevice.Name)
+		param := portaudio.StreamParameters{
+			Input: portaudio.StreamDeviceParameters{
+				Device:   chosenDevice,
+				Channels: Channels,
+				Latency:  chosenDevice.DefaultLowInputLatency,
+			},
+			SampleRate:      SampleRate,
+			FramesPerBuffer: FramesPerBuffer,
+		}
+		stream, err = portaudio.OpenStream(param, audioCallback)
+		if err != nil {
+			log.Printf("Warning: Failed to open '%s': %v. Falling back to default device.", chosenDevice.Name, err)
+			useDefault = true // Mark to fallback
+		} else {
+			fmt.Printf("Using audio input: %s\\n", chosenDevice.Name)
+		}
+	} else {
+		// No specific device was found (e.g., 'Stereo Mix' not present)
+		useDefault = true
+	}
+
+	// If a specific device failed or was never found, use the default.
+	if useDefault {
+		log.Println("Attempting to open stream with default input device.")
 		stream, err = portaudio.OpenDefaultStream(Channels, 0, SampleRate, FramesPerBuffer, audioCallback)
 		if err != nil {
-			// If even the default stream fails, we have to exit.
-			log.Fatalf("Error opening default input stream after fallback: %v", err)
+			log.Fatalf("Error opening default input stream: %v", err)
 		}
+		defaultDevice, _ := portaudio.DefaultInputDevice()
+		fmt.Printf("Using default audio input: %s\\n", defaultDevice.Name)
 	}
 	defer stream.Close()
-
-	if stereoMixFound {
-		fmt.Println("Using 'Stereo Mix' on WASAPI for audio input.")
-	} else {
-		fmt.Println("Using default input device.")
-	}
 
 	// Start the stream
 	err = stream.Start()
