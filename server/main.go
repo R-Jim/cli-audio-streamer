@@ -119,7 +119,7 @@ func main() {
 	defer stream.Close()
 
 	// Create a buffered channel to hold incoming audio packets
-	packetChannel := make(chan []byte, 100) // Buffer up to 100 packets
+	packetChannel := make(chan []byte, 200) // Buffer up to 200 packets
 
 	// Goroutine to read from network and send to channel
 	go func() {
@@ -131,16 +131,30 @@ func main() {
 				continue
 			}
 			if n == PacketSize {
-				packetChannel <- buffer[:n]
+				// Non-blocking send to avoid deadlocks if the channel is full
+				select {
+				case packetChannel <- buffer[:n]:
+				default:
+					log.Println("Jitter buffer is full, dropping packet.")
+				}
 			} else {
 				log.Printf("Received packet of unexpected size: %d bytes (expected %d)", n, PacketSize)
 			}
 		}
 	}()
 
-	// Pre-buffering: wait until we have a few packets
+	// Dynamic Jitter Buffer Management
+	const (
+		MinPrebufferSize = 10  // Minimum packets to start playback
+		MaxBufferSize    = 200 // Corresponds to channel capacity
+		TargetBufferSize = 25  // Ideal number of packets in buffer
+		HighWaterMark    = 40  // Speed up playback if buffer exceeds this
+		LowWaterMark     = 15  // Slow down playback if buffer falls below this
+	)
+
+	// Pre-buffering: wait until we have a minimum number of packets
 	fmt.Println("Pre-buffering audio...")
-	for len(packetChannel) < 4 { // Start when we have 4 packets
+	for len(packetChannel) < MinPrebufferSize {
 		time.Sleep(10 * time.Millisecond)
 	}
 	fmt.Println("Pre-buffering complete. Starting playback.")
@@ -153,20 +167,50 @@ func main() {
 	defer stream.Stop()
 
 	for {
-		// Get the next packet from the channel
-		receiveBuffer := <-packetChannel
+		var receiveBuffer []byte
+
+		// Dynamic adjustment based on buffer level
+		bufferLevel := len(packetChannel)
+		if bufferLevel > HighWaterMark {
+			// Buffer is too full, consume two packets to speed up
+			receiveBuffer = <-packetChannel
+			// We'll process this packet and the next one in this loop iteration
+		} else if bufferLevel < LowWaterMark && bufferLevel > 0 {
+			// Buffer is running low, slow down by potentially adding silence
+			// For simplicity, we'll just process one packet but could add silence here
+			receiveBuffer = <-packetChannel
+		} else {
+			// Buffer is within target range
+			receiveBuffer = <-packetChannel
+		}
 
 		// Read int16 samples from byte buffer
 		reader := bytes.NewReader(receiveBuffer)
+		samplesRead := 0
 		for i := 0; i < len(outputBuffer); i++ {
 			var sample int16
 			err = binary.Read(reader, binary.LittleEndian, &sample)
 			if err != nil {
-				log.Printf("Error reading sample from buffer: %v", err)
+				// This can happen if a packet is smaller than expected
 				break
 			}
 			// Apply server-side volume adjustment
 			outputBuffer[i] = int16(float64(sample) * *serverVolume)
+			samplesRead++
+		}
+
+		// If we need to speed up, process a second packet
+		if bufferLevel > HighWaterMark && len(packetChannel) > 0 {
+			nextPacket := <-packetChannel
+			reader = bytes.NewReader(nextPacket)
+			for i := samplesRead; i < len(outputBuffer); i++ {
+				var sample int16
+				err = binary.Read(reader, binary.LittleEndian, &sample)
+				if err != nil {
+					break
+				}
+				outputBuffer[i] = int16(float64(sample) * *serverVolume)
+			}
 		}
 
 		// Write audio frames to output device
