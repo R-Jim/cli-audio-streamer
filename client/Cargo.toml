@@ -1,0 +1,10 @@
+[package]
+name = "audio-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15"
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
+byteorder = "1.4"
+clap = { version = "4.0", features = ["derive"] }
