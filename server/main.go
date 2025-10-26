@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/gordonklaus/portaudio"
@@ -23,6 +24,149 @@ const (
 	FramesPerBuffer = 512                            // Number of audio frames per buffer
 	PacketSize      = FramesPerBuffer * Channels * 2 // 2 bytes per int16 sample
 )
+
+// SequencedPacket represents a packet with sequence number for reordering
+type SequencedPacket struct {
+	sequence uint32
+	data     []byte
+}
+
+// PacketReorderBuffer handles out-of-order packet reordering
+type PacketReorderBuffer struct {
+	buffer     map[uint32]*SequencedPacket
+	nextSeq    uint32
+	maxLatency int // Maximum number of packets to wait for reordering
+}
+
+// NewPacketReorderBuffer creates a new packet reordering buffer
+func NewPacketReorderBuffer(maxLatency int) *PacketReorderBuffer {
+	return &PacketReorderBuffer{
+		buffer:     make(map[uint32]*SequencedPacket),
+		nextSeq:    0,
+		maxLatency: maxLatency,
+	}
+}
+
+// AddPacket adds a packet with sequence number
+func (prb *PacketReorderBuffer) AddPacket(seq uint32, data []byte) {
+	prb.buffer[seq] = &SequencedPacket{sequence: seq, data: data}
+}
+
+// GetNextPacket returns the next packet in sequence, or nil if not available
+func (prb *PacketReorderBuffer) GetNextPacket() []byte {
+	if packet, exists := prb.buffer[prb.nextSeq]; exists {
+		delete(prb.buffer, prb.nextSeq)
+		prb.nextSeq++
+		return packet.data
+	}
+	return nil
+}
+
+// HasPendingPackets returns true if there are packets waiting for reordering
+func (prb *PacketReorderBuffer) HasPendingPackets() bool {
+	return len(prb.buffer) > 0
+}
+
+// CleanupOldPackets removes packets that are too old to wait for
+func (prb *PacketReorderBuffer) CleanupOldPackets() {
+	for seq := range prb.buffer {
+		if seq < prb.nextSeq {
+			delete(prb.buffer, seq)
+		}
+	}
+}
+
+// JitterBuffer manages audio packets with adaptive sizing and underflow prevention
+type JitterBuffer struct {
+	packets       chan []byte
+	bufferLevel   int64
+	minBufferSize int
+	maxBufferSize int
+	targetSize    int
+	highWaterMark int
+	lowWaterMark  int
+	stats         BufferStats
+	reorderBuffer *PacketReorderBuffer
+}
+
+// BufferStats tracks buffer performance metrics
+type BufferStats struct {
+	underflows     int64
+	overflows      int64
+	silencePackets int64
+	totalPackets   int64
+}
+
+// NewJitterBuffer creates a new adaptive jitter buffer
+func NewJitterBuffer() *JitterBuffer {
+	return &JitterBuffer{
+		packets:       make(chan []byte, 200), // Increased capacity
+		minBufferSize: 5,
+		maxBufferSize: 200,
+		targetSize:    20,
+		highWaterMark: 30,
+		lowWaterMark:  10,
+		stats:         BufferStats{},
+		reorderBuffer: NewPacketReorderBuffer(50), // Wait up to 50 packets for reordering
+	}
+}
+
+// AddPacket adds a packet to the buffer with overflow protection
+func (jb *JitterBuffer) AddPacket(packet []byte) {
+	select {
+	case jb.packets <- packet:
+		atomic.AddInt64(&jb.bufferLevel, 1)
+		atomic.AddInt64(&jb.stats.totalPackets, 1)
+	default:
+		atomic.AddInt64(&jb.stats.overflows, 1)
+		log.Println("Jitter buffer overflow - dropping packet")
+	}
+}
+
+// GetPacket retrieves a packet from the buffer
+func (jb *JitterBuffer) GetPacket() ([]byte, bool) {
+	select {
+	case packet := <-jb.packets:
+		atomic.AddInt64(&jb.bufferLevel, -1)
+		return packet, true
+	default:
+		atomic.AddInt64(&jb.stats.underflows, 1)
+		return nil, false
+	}
+}
+
+// GetBufferLevel returns current buffer level
+func (jb *JitterBuffer) GetBufferLevel() int {
+	return int(atomic.LoadInt64(&jb.bufferLevel))
+}
+
+// ShouldInsertSilence determines if silence should be inserted
+func (jb *JitterBuffer) ShouldInsertSilence() bool {
+	level := jb.GetBufferLevel()
+	return level < jb.lowWaterMark
+}
+
+// IsBufferFull checks if buffer is approaching capacity
+func (jb *JitterBuffer) IsBufferFull() bool {
+	level := jb.GetBufferLevel()
+	return level > jb.highWaterMark
+}
+
+// GetStats returns current buffer statistics
+func (jb *JitterBuffer) GetStats() BufferStats {
+	return BufferStats{
+		underflows:     atomic.LoadInt64(&jb.stats.underflows),
+		overflows:      atomic.LoadInt64(&jb.stats.overflows),
+		silencePackets: atomic.LoadInt64(&jb.stats.silencePackets),
+		totalPackets:   atomic.LoadInt64(&jb.stats.totalPackets),
+	}
+}
+
+// InsertSilencePacket creates a silent audio packet
+func (jb *JitterBuffer) InsertSilencePacket() []byte {
+	atomic.AddInt64(&jb.stats.silencePackets, 1)
+	return make([]byte, PacketSize) // Zero-filled buffer = silence
+}
 
 func main() {
 	listenPort := flag.Int("port", 8080, "Port to listen for audio stream")
@@ -118,43 +262,63 @@ func main() {
 	}
 	defer stream.Close()
 
-	// Create a buffered channel to hold incoming audio packets
-	packetChannel := make(chan []byte, 100) // Buffer up to 100 packets
+	// Create adaptive jitter buffer
+	jitterBuffer := NewJitterBuffer()
 
-	// Goroutine to read from network and send to channel
+	// Goroutine to read from network and send to jitter buffer
 	go func() {
 		for {
-			buffer := make([]byte, PacketSize)
+			buffer := make([]byte, PacketSize+4) // +4 for sequence number
 			n, _, err := audioConn.ReadFromUDP(buffer)
 			if err != nil {
 				log.Printf("Error reading UDP packet: %v", err)
 				continue
 			}
-			if n == PacketSize {
-				// Non-blocking send to avoid deadlocks if the channel is full
-				select {
-				case packetChannel <- buffer[:n]:
-				default:
-					log.Println("Jitter buffer is full, dropping packet.")
+			if n == PacketSize+4 {
+				// Extract sequence number (first 4 bytes)
+				seq := binary.LittleEndian.Uint32(buffer[:4])
+				audioData := buffer[4:n]
+
+				// Add to reorder buffer
+				jitterBuffer.reorderBuffer.AddPacket(seq, audioData)
+
+				// Try to get packets in order and add to jitter buffer
+				for {
+					if orderedPacket := jitterBuffer.reorderBuffer.GetNextPacket(); orderedPacket != nil {
+						jitterBuffer.AddPacket(orderedPacket)
+					} else {
+						break
+					}
 				}
+
+				// Periodically clean up old packets
+				jitterBuffer.reorderBuffer.CleanupOldPackets()
+			} else if n == PacketSize {
+				// Fallback for packets without sequence numbers (legacy support)
+				jitterBuffer.AddPacket(buffer[:n])
 			} else {
-				log.Printf("Received packet of unexpected size: %d bytes (expected %d)", n, PacketSize)
+				log.Printf("Received packet of unexpected size: %d bytes (expected %d or %d)", n, PacketSize, PacketSize+4)
 			}
 		}
 	}()
 
-	// Dynamic Jitter Buffer Management
-	const (
-		MinPrebufferSize = 5   // Minimum packets to start playback
-		MaxBufferSize    = 100 // Corresponds to channel capacity
-		TargetBufferSize = 15  // Ideal number of packets in buffer
-		HighWaterMark    = 20  // Speed up playback if buffer exceeds this
-		LowWaterMark     = 10  // Slow down playback if buffer falls below this
-	)
+	// Goroutine to periodically log buffer statistics
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stats := jitterBuffer.GetStats()
+			level := jitterBuffer.GetBufferLevel()
+			if stats.underflows > 0 || stats.overflows > 0 || stats.silencePackets > 0 {
+				log.Printf("Buffer stats - Level: %d, Underflows: %d, Overflows: %d, Silence: %d, Total: %d",
+					level, stats.underflows, stats.overflows, stats.silencePackets, stats.totalPackets)
+			}
+		}
+	}()
 
 	// Pre-buffering: wait until we have a minimum number of packets
 	fmt.Println("Pre-buffering audio...")
-	for len(packetChannel) < MinPrebufferSize {
+	for jitterBuffer.GetBufferLevel() < jitterBuffer.minBufferSize {
 		time.Sleep(10 * time.Millisecond)
 	}
 	fmt.Println("Pre-buffering complete. Starting playback.")
@@ -168,25 +332,21 @@ func main() {
 
 	for {
 		var receiveBuffer []byte
+		var ok bool
 
-		// Dynamic adjustment based on buffer level
-		bufferLevel := len(packetChannel)
-		if bufferLevel > HighWaterMark {
-			// Buffer is too full, consume two packets to speed up
-			receiveBuffer = <-packetChannel
-			// We'll process this packet and the next one in this loop iteration
-		} else if bufferLevel < LowWaterMark && bufferLevel > 0 {
-			// Buffer is running low, slow down by potentially adding silence
-			// For simplicity, we'll just process one packet but could add silence here
-			receiveBuffer = <-packetChannel
+		// Get packet from jitter buffer or insert silence if underflow
+		if jitterBuffer.ShouldInsertSilence() {
+			receiveBuffer = jitterBuffer.InsertSilencePacket()
 		} else {
-			// Buffer is within target range
-			receiveBuffer = <-packetChannel
+			receiveBuffer, ok = jitterBuffer.GetPacket()
+			if !ok {
+				// This shouldn't happen due to ShouldInsertSilence check, but just in case
+				receiveBuffer = jitterBuffer.InsertSilencePacket()
+			}
 		}
 
 		// Read int16 samples from byte buffer
 		reader := bytes.NewReader(receiveBuffer)
-		samplesRead := 0
 		for i := 0; i < len(outputBuffer); i++ {
 			var sample int16
 			err = binary.Read(reader, binary.LittleEndian, &sample)
@@ -196,20 +356,14 @@ func main() {
 			}
 			// Apply server-side volume adjustment
 			outputBuffer[i] = int16(float64(sample) * *serverVolume)
-			samplesRead++
 		}
 
-		// If we need to speed up, process a second packet
-		if bufferLevel > HighWaterMark && len(packetChannel) > 0 {
-			nextPacket := <-packetChannel
-			reader = bytes.NewReader(nextPacket)
-			for i := samplesRead; i < len(outputBuffer); i++ {
-				var sample int16
-				err = binary.Read(reader, binary.LittleEndian, &sample)
-				if err != nil {
-					break
-				}
-				outputBuffer[i] = int16(float64(sample) * *serverVolume)
+		// If buffer is too full, consume an extra packet to speed up playback
+		if jitterBuffer.IsBufferFull() {
+			if extraPacket, ok := jitterBuffer.GetPacket(); ok {
+				// We consumed an extra packet but don't use it for audio
+				// This helps reduce latency when buffer is building up
+				_ = extraPacket
 			}
 		}
 
